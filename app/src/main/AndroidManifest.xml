@@ -7,6 +7,7 @@
         android:maxSdkVersion="28" />
     <application
         android:label="ComposeShot"
+        android:icon="@drawable/ic_launcher"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
             android:name=".MainActivity"
