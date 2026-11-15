@@ -5,7 +5,6 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.graphics.PointF
 import android.graphics.Typeface
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -30,10 +29,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.MeteringPointFactory
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -95,9 +93,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent) {
         val rm = FloatArray(9)
         val orient = FloatArray(3)
-        android.hardware.SensorManager.getRotationMatrixFromVector(rm, event.values)
+        SensorManager.getRotationMatrixFromVector(rm, event.values)
         SensorManager.getOrientation(rm, orient)
-        // orient[2] is roll in radians; flip sign so the line sits level on the real horizon
         overlay.levelAngleDeg = -Math.toDegrees(orient[2].toDouble()).toFloat()
     }
 
@@ -110,7 +107,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         root.addView(previewView, MATCH_PARENT, MATCH_PARENT)
         root.addView(overlay, MATCH_PARENT, MATCH_PARENT)
 
-        // Tap to focus and expose at the touched point.
         previewView.setOnTouchListener { _, e ->
             if (e.action == MotionEvent.ACTION_UP) focusAt(e.x, e.y)
             true
@@ -149,129 +145,4 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val switches = LinearLayout(this).apply { gravity = Gravity.CENTER }
         autoZoom = Switch(this).apply { text = "Auto-zoom  "; setTextColor(Color.WHITE); isChecked = true }
         autoShot = Switch(this).apply { text = "  Auto-shoot"; setTextColor(Color.WHITE) }
-        switches.addView(autoZoom); switches.addView(autoShot)
-
-        val controls = LinearLayout(this).apply { gravity = Gravity.CENTER; orientation = LinearLayout.HORIZONTAL }
-        timerButton = Button(this).apply { text = "Timer: Off"; setOnClickListener { cycleTimer() } }
-        shutter = Button(this).apply { text = "●  Capture"; setOnClickListener { startCapture() } }
-        controls.addView(timerButton); controls.addView(shutter)
-
-        bottom.addView(label); bottom.addView(exposureBar)
-        bottom.addView(switches); bottom.addView(controls)
-        root.addView(bottom, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
-        return root
-    }
-
-    private fun startCamera() {
-        val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({
-            val provider = future.get()
-            val res = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-                .build()
-
-            val preview = Preview.Builder().setResolutionSelector(res).build()
-                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
-            imageCapture = ImageCapture.Builder().setResolutionSelector(res)
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
-            val analysis = ImageAnalysis.Builder().setResolutionSelector(res)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                .also { it.setAnalyzer(analysisExecutor, SubjectAnalyzer(::onSubject)) }
-
-            provider.unbindAll()
-            camera = provider.bindToLifecycle(
-                this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture, analysis
-            )
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun focusAt(x: Float, y: Float) {
-        val cam = camera ?: return
-        val factory = previewView.meteringPointFactory
-        val point = factory.createPoint(x, y)
-        val action = FocusMeteringAction.Builder(point)
-            .setAutoCancelDuration(3, TimeUnit.SECONDS).build()
-        cam.cameraControl.startFocusAndMetering(action)
-
-        // Convert the screen tap to the 0..1 frame space used by the overlay.
-        val r = overlay.contentRect()
-        if (r.width() > 0 && x in r.left..r.right && y in r.top..r.bottom) {
-            overlay.focusPoint = Pair((x - r.left) / r.width(), (y - r.top) / r.height())
-        }
-    }
-
-    private fun applyExposure(progress: Int) {
-        val cam = camera ?: return
-        val range = cam.cameraInfo.exposureState.exposureCompensationRange
-        if (!cam.cameraInfo.exposureState.isExposureCompensationSupported) return
-        val idx = range.lower + ((range.upper - range.lower) * progress / 100)
-        cam.cameraControl.setExposureCompensationIndex(idx)
-    }
-
-    private fun cycleTimer() {
-        timerSeconds = when (timerSeconds) { 0 -> 3; 3 -> 10; else -> 0 }
-        timerButton.text = if (timerSeconds == 0) "Timer: Off" else "Timer: ${timerSeconds}s"
-    }
-
-    /** Capture button: optional countdown, then take the photo. */
-    private fun startCapture() {
-        if (timerSeconds == 0) { takePhoto(); return }
-        shutter.isEnabled = false
-        countdown?.cancel()
-        countdown = object : CountDownTimer(timerSeconds * 1000L, 1000L) {
-            override fun onTick(ms: Long) { hintText.text = "${ms / 1000 + 1}" }
-            override fun onFinish() { shutter.isEnabled = true; hintText.text = "📸"; takePhoto() }
-        }.start()
-    }
-
-    /** Runs on an ML Kit callback thread; hop to main for UI + camera control. */
-    private fun onSubject(subject: android.graphics.RectF?) {
-        runOnUiThread {
-            val cam = camera ?: return@runOnUiThread
-            val z = cam.cameraInfo.zoomState.value ?: return@runOnUiThread
-            val result = CompositionEngine.evaluate(subject, z.zoomRatio, z.minZoomRatio, z.maxZoomRatio)
-            overlay.result = result
-            if (countdown == null || !shutter.isEnabled.not()) hintText.text = result.hint
-            scoreText.text = if (subject == null) "" else "Composition ${result.score}/100"
-
-            if (autoZoom.isChecked) {
-                val target = result.targetZoom
-                if (target != null) {
-                    val cur = smoothedZoom ?: z.zoomRatio
-                    val next = cur + (target - cur) * 0.15f
-                    smoothedZoom = next
-                    cam.cameraControl.setZoomRatio(next)
-                } else smoothedZoom = null
-            }
-
-            stableFrames = if (result.score >= 85) stableFrames + 1 else 0
-            val now = System.currentTimeMillis()
-            if (autoShot.isChecked && stableFrames >= 12 && now - lastShotAt > 4000) {
-                lastShotAt = now; stableFrames = 0; takePhoto()
-            }
-        }
-    }
-
-    private fun takePhoto() {
-        val capture = imageCapture ?: return
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "ComposeShot_${System.currentTimeMillis()}")
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ComposeShot")
-        }
-        val out = ImageCapture.OutputFileOptions.Builder(
-            contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
-        ).build()
-        capture.takePicture(out, ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(r: ImageCapture.OutputFileResults) {
-                    Toast.makeText(this@MainActivity, "Saved to Pictures/ComposeShot", Toast.LENGTH_SHORT).show()
-                }
-                override fun onError(e: ImageCaptureException) {
-                    Toast.makeText(this@MainActivity, "Capture failed: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            })
-    }
-
-    override fun onDestroy() { super.onDestroy(); analysisExecutor.shutdown() }
-}
+        switche
