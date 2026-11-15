@@ -33,6 +33,8 @@ class OverlayView(context: Context) : View(context) {
         }
     }
 
+    fun contentRect(): RectF = content()
+
     override fun onDraw(c: Canvas) {
         val r = content()
         for (i in 1..2) {
