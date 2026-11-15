@@ -47,11 +47,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var overlay: OverlayView
     private lateinit var hintText: TextView
     private lateinit var scoreText: TextView
+    private lateinit var triangleText: TextView
     private lateinit var autoZoom: Switch
     private lateinit var autoShot: Switch
     private lateinit var exposureBar: SeekBar
     private lateinit var timerButton: Button
     private lateinit var shutter: Button
+    private lateinit var triangleButton: Button
 
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
@@ -59,6 +61,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var sensors: SensorManager
     private var countdown: CountDownTimer? = null
     private var timerSeconds = 0
+
+    private val sceneMeter = SceneMeter()
+    private var sceneEv: Double? = null
+    private var triangleOn = false
 
     private var smoothedZoom: Float? = null
     private var stableFrames = 0
@@ -92,7 +98,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent) {
         val rm = FloatArray(9)
-                val orient = FloatArray(3)
+        val orient = FloatArray(3)
         SensorManager.getRotationMatrixFromVector(rm, event.values)
         SensorManager.getOrientation(rm, orient)
         overlay.levelAngleDeg = -Math.toDegrees(orient[2].toDouble()).toFloat()
@@ -123,7 +129,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         scoreText = TextView(this).apply {
             setTextColor(Color.WHITE); textSize = 14f; setShadowLayer(6f, 0f, 0f, Color.BLACK)
         }
-        top.addView(hintText); top.addView(scoreText)
+        triangleText = TextView(this).apply {
+            setTextColor(Color.rgb(255, 204, 0)); textSize = 14f
+            gravity = Gravity.CENTER; setShadowLayer(6f, 0f, 0f, Color.BLACK)
+        }
+        top.addView(hintText); top.addView(scoreText); top.addView(triangleText)
         root.addView(top, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.TOP))
 
         val bottom = LinearLayout(this).apply {
@@ -145,12 +155,22 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val switches = LinearLayout(this).apply { gravity = Gravity.CENTER }
         autoZoom = Switch(this).apply { text = "Auto-zoom  "; setTextColor(Color.WHITE); isChecked = true }
         autoShot = Switch(this).apply { text = "  Auto-shoot"; setTextColor(Color.WHITE) }
+        triangleButton = Button(this).apply {
+            text = "Auto: Off"
+            ContextCompat.getDrawable(this@MainActivity, R.drawable.ic_auto_triangle)
+                ?.let { setCompoundDrawablesWithIntrinsicBounds(it, null, null, null) }
+            setOnClickListener {
+                triangleOn = !triangleOn
+                text = if (triangleOn) "Auto: On" else "Auto: Off"
+                updateTriangle()
+            }
+        }
         switches.addView(autoZoom); switches.addView(autoShot)
 
         val controls = LinearLayout(this).apply { gravity = Gravity.CENTER; orientation = LinearLayout.HORIZONTAL }
         timerButton = Button(this).apply { text = "Timer: Off"; setOnClickListener { cycleTimer() } }
         shutter = Button(this).apply { text = "●  Capture"; setOnClickListener { startCapture() } }
-        controls.addView(timerButton); controls.addView(shutter)
+        controls.addView(triangleButton); controls.addView(timerButton); controls.addView(shutter)
 
         val credit = TextView(this).apply {
             text = "Made by Yves Sidney Valeriano"
@@ -177,15 +197,33 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 .also { it.setSurfaceProvider(previewView.surfaceProvider) }
             imageCapture = ImageCapture.Builder().setResolutionSelector(res)
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
+
+            val subject = SubjectAnalyzer(::onSubject)
             val analysis = ImageAnalysis.Builder().setResolutionSelector(res)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                .also { it.setAnalyzer(analysisExecutor, SubjectAnalyzer(::onSubject)) }
+                .also {
+                    it.setAnalyzer(analysisExecutor) { proxy ->
+                        // Read brightness first (no close), then the subject analyzer closes the frame.
+                        sceneMeter.measure(proxy)?.let { ev ->
+                            runOnUiThread { sceneEv = ev; updateTriangle() }
+                        }
+                        subject.analyze(proxy)
+                    }
+                }
 
             provider.unbindAll()
             camera = provider.bindToLifecycle(
                 this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture, analysis
             )
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /** Shows the suggested aperture, shutter and ISO for what the camera sees. */
+    private fun updateTriangle() {
+        if (!triangleOn) { triangleText.text = ""; return }
+        val ev = sceneEv ?: run { triangleText.text = "Reading scene…"; return }
+        val s = ExposureTriangle.solve(ev, ExposureMode.AUTO_MIX, 1.8)
+        triangleText.text = "Suggested: ${s.summary()}\n${s.note}"
     }
 
     private fun focusAt(x: Float, y: Float) {
