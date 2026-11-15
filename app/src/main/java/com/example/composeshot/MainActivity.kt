@@ -14,11 +14,14 @@ import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.provider.MediaStore
+import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -47,11 +50,23 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
+    companion object {
+        /** Third-stop apertures from f/1.4 to f/25. */
+        val APERTURES = listOf(
+            1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0, 5.6, 6.3,
+            7.1, 8.0, 9.0, 10.0, 11.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0, 25.0
+        )
+    }
+
     private lateinit var previewView: PreviewView
     private lateinit var overlay: OverlayView
     private lateinit var hintText: TextView
     private lateinit var scoreText: TextView
     private lateinit var triangleText: TextView
+    private lateinit var apertureLabel: TextView
+    private lateinit var apertureBar: SeekBar
+    private lateinit var manualCheck: CheckBox
+    private lateinit var evInput: EditText
     private lateinit var autoZoom: Switch
     private lateinit var autoShot: Switch
     private lateinit var exposureBar: SeekBar
@@ -69,6 +84,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val sceneMeter = SceneMeter()
     private var sceneEv: Double? = null
     private var triangleOn = false
+    private var aperture = 1.8
 
     private var smoothedZoom: Float? = null
     private var stableFrames = 0
@@ -144,16 +160,40 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
             setPadding(24, 0, 24, 64)
         }
-        exposureBar = SeekBar(this).apply {
-            max = 100; progress = 50
+
+        apertureLabel = TextView(this).apply {
+            text = "Aperture f/1.8"; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+        }
+        apertureBar = SeekBar(this).apply {
+            max = APERTURES.size - 1
+            progress = APERTURES.indexOf(1.8)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                    if (fromUser) applyExposure(p)
+                    aperture = APERTURES[p]
+                    apertureLabel.text = "Aperture f/${APERTURES[p]}"
+                    updateTriangle()
                 }
                 override fun onStartTrackingTouch(s: SeekBar?) {}
                 override fun onStopTrackingTouch(s: SeekBar?) {}
             })
         }
+
+        manualCheck = CheckBox(this).apply {
+            text = "Use my meter reading"; setTextColor(Color.WHITE)
+            setOnCheckedChangeListener { _, _ -> updateTriangle() }
+        }
+        evInput = EditText(this).apply {
+            hint = "EV at ISO 100 (e.g. 12)"; setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or
+                InputType.TYPE_NUMBER_FLAG_SIGNED
+            gravity = Gravity.CENTER
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) { updateTriangle() }
+            })
+        }
+
         val label = TextView(this).apply { text = "Exposure"; setTextColor(Color.WHITE); gravity = Gravity.CENTER }
 
         val switches = LinearLayout(this).apply { gravity = Gravity.CENTER }
@@ -182,6 +222,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             setShadowLayer(6f, 0f, 0f, Color.BLACK)
         }
 
+        bottom.addView(apertureLabel); bottom.addView(apertureBar)
+        bottom.addView(manualCheck); bottom.addView(evInput)
         bottom.addView(label); bottom.addView(exposureBar)
         bottom.addView(switches); bottom.addView(controls)
         bottom.addView(credit)
@@ -195,12 +237,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         future.addListener({
             val provider = future.get()
 
-            // Preview and analysis use a normal size so the screen and scoring stay fast.
             val previewRes = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .build()
 
-            // Photos use the largest size the sensor offers.
             val captureRes = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
@@ -213,7 +253,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 .setResolutionSelector(captureRes)
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                 .setJpegQuality(100)
-            // Ask the camera for its highest-quality noise reduction and sharpening.
             Camera2Interop.Extender(captureBuilder)
                 .setCaptureRequestOption(
                     CaptureRequest.NOISE_REDUCTION_MODE,
@@ -230,7 +269,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
                 .also {
                     it.setAnalyzer(analysisExecutor) { proxy ->
-                        // Read brightness first (no close), then the subject analyzer closes the frame.
                         sceneMeter.measure(proxy)?.let { ev ->
                             runOnUiThread { sceneEv = ev; updateTriangle() }
                         }
@@ -245,12 +283,25 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Shows the suggested aperture, shutter and ISO for what the camera sees. */
+    /** Uses the typed meter reading if the box is ticked, otherwise the phone's estimate. */
+    private fun currentEv(): Double? {
+        if (manualCheck.isChecked) {
+            return evInput.text.toString().toDoubleOrNull()
+        }
+        return sceneEv
+    }
+
+    /** Shows the suggested shutter and ISO for the chosen aperture and the light reading. */
     private fun updateTriangle() {
+        if (!::triangleText.isInitialized) return
         if (!triangleOn) { triangleText.text = ""; return }
-        val ev = sceneEv ?: run { triangleText.text = "Reading scene…"; return }
-        val s = ExposureTriangle.solve(ev, ExposureMode.AUTO_MIX, 1.8)
-        triangleText.text = "Suggested: ${s.summary()}\n${s.note}"
+        val ev = currentEv() ?: run {
+            triangleText.text = if (manualCheck.isChecked) "Type an EV reading" else "Reading scene…"
+            return
+        }
+        val s = ExposureTriangle.solve(ev, ExposureMode.AUTO_MIX, aperture)
+        val source = if (manualCheck.isChecked) "meter" else "scene"
+        triangleText.text = "Suggested ($source): ${s.summary()}\n${s.note}"
     }
 
     private fun focusAt(x: Float, y: Float) {
