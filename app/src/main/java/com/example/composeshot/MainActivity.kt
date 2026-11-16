@@ -10,7 +10,6 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.provider.MediaStore
@@ -30,8 +29,6 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
@@ -41,7 +38,6 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -77,7 +73,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
     private val analysisExecutor = Executors.newSingleThreadExecutor()
-    private lateinit var sensors: SensorManager
+    private var sensors: SensorManager? = null
     private var countdown: CountDownTimer? = null
     private var timerSeconds = 0
 
@@ -92,28 +88,50 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         if (it) startCamera() else {
-            Toast.makeText(this, "Camera permission needed", Toast.LENGTH_LONG).show(); finish()
+            showError("Camera permission is off. Turn it on in Settings, then Apps, then ComposeShot.")
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(buildUi())
-        sensors = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED) startCamera()
-        else permission.launch(Manifest.permission.CAMERA)
+        try {
+            setContentView(buildUi())
+            sensors = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED) startCamera()
+            else permission.launch(Manifest.permission.CAMERA)
+        } catch (e: Throwable) {
+            showError("Startup error: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /** Shows the problem on screen instead of closing the app. */
+    private fun showError(message: String) {
+        val box = TextView(this).apply {
+            text = message
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.rgb(120, 0, 0))
+            setPadding(32, 32, 32, 32)
+            textSize = 16f
+        }
+        setContentView(FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            addView(box, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER))
+        })
     }
 
     override fun onResume() {
         super.onResume()
-        sensors.registerListener(this, sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR),
-            SensorManager.SENSOR_DELAY_UI)
+        sensors?.let { s ->
+            s.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.let {
+                s.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            }
+        }
     }
 
     override fun onPause() {
         super.onPause()
-        sensors.unregisterListener(this)
+        sensors?.unregisterListener(this)
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -231,56 +249,50 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         return root
     }
 
-    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun startCamera() {
-        val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({
-            val provider = future.get()
+        try {
+            val future = ProcessCameraProvider.getInstance(this)
+            future.addListener({
+                try {
+                    val provider = future.get()
 
-            val previewRes = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-                .build()
+                    val res = ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                        .build()
 
-            val captureRes = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-                .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
-                .build()
+                    val preview = Preview.Builder().setResolutionSelector(res).build()
+                        .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
-            val preview = Preview.Builder().setResolutionSelector(previewRes).build()
-                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                    imageCapture = ImageCapture.Builder().setResolutionSelector(res)
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
 
-            val captureBuilder = ImageCapture.Builder()
-                .setResolutionSelector(captureRes)
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                .setJpegQuality(100)
-            Camera2Interop.Extender(captureBuilder)
-                .setCaptureRequestOption(
-                    CaptureRequest.NOISE_REDUCTION_MODE,
-                    CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
-                )
-                .setCaptureRequestOption(
-                    CaptureRequest.EDGE_MODE,
-                    CaptureRequest.EDGE_MODE_HIGH_QUALITY
-                )
-            imageCapture = captureBuilder.build()
-
-            val subject = SubjectAnalyzer(::onSubject)
-            val analysis = ImageAnalysis.Builder().setResolutionSelector(previewRes)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                .also {
-                    it.setAnalyzer(analysisExecutor) { proxy ->
-                        sceneMeter.measure(proxy)?.let { ev ->
-                            runOnUiThread { sceneEv = ev; updateTriangle() }
+                    val subject = SubjectAnalyzer(::onSubject)
+                    val analysis = ImageAnalysis.Builder().setResolutionSelector(res)
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
+                        .also {
+                            it.setAnalyzer(analysisExecutor) { proxy ->
+                                try {
+                                    sceneMeter.measure(proxy)?.let { ev ->
+                                        runOnUiThread { sceneEv = ev; updateTriangle() }
+                                    }
+                                    subject.analyze(proxy)
+                                } catch (e: Throwable) {
+                                    proxy.close()
+                                }
+                            }
                         }
-                        subject.analyze(proxy)
-                    }
-                }
 
-            provider.unbindAll()
-            camera = provider.bindToLifecycle(
-                this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture, analysis
-            )
-        }, ContextCompat.getMainExecutor(this))
+                    provider.unbindAll()
+                    camera = provider.bindToLifecycle(
+                        this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture, analysis
+                    )
+                } catch (e: Throwable) {
+                    showError("Camera error: ${e.javaClass.simpleName}: ${e.message}")
+                }
+            }, ContextCompat.getMainExecutor(this))
+        } catch (e: Throwable) {
+            showError("Camera start error: ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 
     /** Uses the typed meter reading if the box is ticked, otherwise the phone's estimate. */
